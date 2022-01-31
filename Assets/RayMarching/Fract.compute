@@ -1,0 +1,207 @@
+#pragma kernel CSMain
+
+RWTexture2D<float4> Dest;
+
+float4x4 _CameraToWorld;
+float4x4 _CameraInverseProjection;
+float3 _LightDirection;
+float _Time;
+float _Pow;
+int _Iterations;
+bool _julia;
+float3 _col1;
+float3 _col2;
+float3 _col3;
+float3 _iColor;
+float3 _BgColor;
+float3 _C;
+bool _Cross;
+float EPSILON;
+
+struct Ray {
+    float3 origin;
+    float3 direction;
+};
+
+Ray CreateRay(float2 uv) {
+    Ray r;
+    r.origin = mul(_CameraToWorld,float4(0,0,0,1)).xyz;
+    float3 fragPos = mul(_CameraInverseProjection, float4(uv,0,1)).xyz;
+    r.direction = normalize(mul(_CameraToWorld, float4(fragPos,0)).xyz);
+
+    return r;
+}
+
+float2 map(float3 pos, out float4 col){
+    float3 w = pos; 
+    float dz =1.0;
+    float m= dot(w,w);
+    float4 oT = float4(abs(w),m);
+    float o = 1000000.0;
+    float p = _Pow; //power of the set
+    float ni = 0.0;
+    float cross = (_Cross) ? pos.y : 0;
+
+    for(int i = 0; i < _Iterations; i++){
+
+        dz = pow(sqrt(m),p-1.0)*p*dz+1;
+        float r = length(w);
+        float ph = p*atan2(w.y,w.x);
+        float th= p*acos(w.z/r);
+
+        if(_julia) {
+            w = pow(r,p) * float3(sin(th)*cos(ph),sin(th)*sin(ph),cos(th))+_C;
+        }
+        else {
+            w = pow(r,p) * float3(sin(th)*cos(ph),sin(th)*sin(ph),cos(th))+pos;
+        }
+        oT = min(oT,float4(abs(w),m));
+        o = min(o,length(oT));
+        m = dot(w,w);
+        if(m > 256.0) break;
+        ni+=1.0;
+    }
+
+    col = float4(m,oT.yzw);
+    float d = 0.25*log(m)*sqrt(m)/dz;
+    d = min(o,d);
+    d = (_Cross) ? max(d,pos.y) : d;
+    return float2(d,ni);
+}
+
+float2 raymarch(Ray r, out float4 col){
+    float2 res =float2(-1.0,-1.0);
+    col = float4(0.5,0.0,0.0,1.0);
+    float tmin = 0.00025;
+    float tmax = 256.0;
+
+    float4 oT;
+
+    float t = tmin;
+    float lt = 0.0;
+    float lh = 0.0;
+
+    for(int i = 0; i<128; i++){
+        float3 pos = r.origin+r.direction*t;
+        float th = 0.25*EPSILON*t;
+        res = map(pos, oT);
+        lt = t;
+        lh = res.x;
+        if( t>tmax|| res.x<th) break;
+        t += res.x;
+    }
+
+    if( lt>0.0001 && res.x<0.0 ) t = lt - lh*(t-lt)/(res.x-lh);
+
+     if( t<tmax)
+    {
+        col = oT;
+        res.x = t;
+    }
+
+    return res;
+}
+
+//tetrahedron technique https://iquilezles.org/www/articles/normalsSDF/normalsSDF.htm
+
+float3 calculateNormal(float3 p){
+    float4 unused;
+    float2 k = float2(1,-1)*0.5773*EPSILON;
+    return normalize(k.yxx*map(p+k.yxx,unused).x + 
+                     k.xxy*map(p+k.xxy,unused).x + 
+                     k.xyx*map(p+k.xyx,unused).x +
+                     k.yyy*map(p+k.yyy,unused).x );
+}
+
+
+float softshadow(float3 or, float3 dir){
+    float res = 1.0;
+    float t = 0.0001;
+    for( int i=0; i<64; i++ ){
+        float4 unused;
+        float2 d = map(or+dir*t,unused);
+        res = min(res,32.0*d.x/t);
+        if(res < EPSILON) break;
+        t+= clamp(res,0.0,1.0);
+    }
+    return clamp(res,0.0,1.0);
+}
+
+float4 colorSurf(float3 pos,float3 normal,float2 dist){
+    float3 col =0.1*cos(log2(dist.y))*0.9+3.5*float3(_iColor);
+    if( pos.y>0.0 ) col = lerp(col,float3(1.0,1.0,1.0),0.2);
+    float ins = smoothstep(14.0,15.0,dist.y);
+    col*= float3(0.45,0.42,0.40) + float3(0.55,0.58,0.60)*ins;
+    col = lerp(col*col*(3.0-2.0*col),col,ins);
+    float c = dot(col,float3(0.33,0.33,0.33));
+    col = lerp(lerp(col,float3(c,c,c),-0.4),col,ins);
+    col = saturate(col*0.65);
+
+    return float4(col,1.0);
+}
+
+float4 render(Ray r, float2 uv){
+    float4 col = float4(0.0,0.0,0.0,0.0);
+    float4 oT;
+    float2 d = raymarch(r,oT);
+    float3 pos = r.origin+r.direction*d.x;
+    float3 normal = calculateNormal(pos);
+
+    if(d.x<0.0 || d.y < oT.w ){
+        float3 sky = _BgColor*smoothstep(1,uv.y,0.7);
+
+        col = float4(sky,1.0);
+    } else if(oT.x  <= d.y) {
+
+        float3 fractCol = colorSurf(pos,normal,d).xyz;
+
+        col = float4(fractCol,1.0);
+    } else {
+        float3 fractCol = float3(0.00,0.00,0.00);
+        fractCol = lerp( fractCol, _col1, saturate(oT.y) );
+	 	fractCol = lerp( fractCol, _col2, saturate(oT.z*oT.z) )*0.25*d.y;
+        fractCol = lerp( fractCol, _col3, saturate(pow(oT.w,6.0)));
+        fractCol *= 0.8;
+    
+        float3 lightdir = -_LightDirection;
+        float3 rdy = dot(normal,r.direction)*normal;
+        float3 rdx = r.direction-rdy;
+        float3 ref = rdx-rdy;
+
+        float occlusion = saturate(0.05*log(oT.x));
+        float shadow = softshadow(pos,lightdir);
+        float diff = max(0.0,dot(lightdir,normal));
+        float skyref = max(0.0,normal.y);
+        float indirect = max(0.0,dot(-lightdir,normal));
+        float spec = pow(max(0.0,dot(ref,lightdir)),16.0);
+
+        fractCol *= diff*shadow;
+        fractCol+=float3(_BgColor)*skyref*occlusion;
+        fractCol+=float3(0.4,0.4,0.4)*indirect*occlusion;
+        fractCol += 0.1*occlusion;
+        fractCol += spec*shadow*float3(0.3,0.4,0.2);
+    
+         
+        col = float4(fractCol,1.0);
+    }
+
+    col = pow(abs(col),float4(0.45,0.45,0.45,1.0)); // gamma correction 
+
+
+    return col;
+}
+
+[numthreads(8,8,1)]
+void CSMain (uint3 id : SV_DispatchThreadID)
+{
+    uint width,height;
+    float4 col = float4(0.5,0.0,0.0,1.0);
+
+    Dest.GetDimensions(width,height);
+    float2 uv = id.xy / float2(width,height);
+    EPSILON =2.0/(height*1.25);
+    Ray r = CreateRay(uv*2-1);
+    col = render(r,uv);
+    
+    Dest[id.xy] = col;
+}
